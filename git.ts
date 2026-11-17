@@ -219,9 +219,10 @@ function parseV0UploadPack(body: Buffer): FetchRequest | null {
 }
 
 function sidebandPack(pack: Buffer): Buffer {
-  // The packfile section's sideband packets: band 1, chunked to pkt-line size.
+  // The packfile section's sideband packets: band 1, chunked so no pkt-line
+  // exceeds the 65520-byte limit (4 length bytes + 1 band byte + data).
   const parts: Buffer[] = [];
-  const CHUNK = 65519;
+  const CHUNK = 65515;
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
     const slice = pack.subarray(offset, Math.min(offset + CHUNK, pack.length));
     parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
@@ -385,7 +386,8 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
 function reportBytes(text: string): Buffer {
   const inner = encodePktLines(text.split('\n').filter((line) => line !== '').map((line) => `${line}\n`));
   const parts: Buffer[] = [];
-  const CHUNK = 65519;
+  // Same 65520-byte pkt-line limit as sidebandPack (4 length + 1 band + data).
+  const CHUNK = 65515;
   for (let offset = 0; offset < inner.length; offset += CHUNK) {
     const slice = inner.subarray(offset, Math.min(offset + CHUNK, inner.length));
     parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
