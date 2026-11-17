@@ -253,8 +253,9 @@ function v2FetchResponse(store: Store, repo: RepoRec, fetch: FetchRequest): Buff
   }
   // wanted-refs (always present, even when no want matches a ref tip)
   const wantedRefs: string[] = [];
+  const advertised = refLines(repo);
   for (const want of fetch.wants) {
-    for (const line of refLines(repo)) {
+    for (const line of advertised) {
       if (line.oid === want && line.name.startsWith('refs/')) wantedRefs.push(`${want} ${line.name}\n`);
     }
   }

@@ -31,16 +31,39 @@ function jsonBody(status: number, value: unknown): { status: number; headers: Re
   return { status, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify(value), 'utf8') };
 }
 
-async function readBody(request: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of request) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+/**
+ * Read the whole request body. Plain data/end listeners, not the async
+ * iterator: a small POST body is usually one chunk, and the iterator's
+ * per-chunk promise machinery is pure overhead on that path (every git push,
+ * issue create, GraphQL and MCP call pays it).
+ */
+function readBody(request: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    request.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        settled = true;
+        reject(new Error('request body too large'));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    request.on('error', (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+  });
 }
 
 function toRestRequest(request: IncomingMessage, body: Buffer, path: string, query: URLSearchParams): RestRequest {

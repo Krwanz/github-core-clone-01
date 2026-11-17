@@ -9,7 +9,7 @@
 // its replay therefore see the same answers.
 
 import { createHash } from 'node:crypto';
-import { createInflate, deflateSync } from 'node:zlib';
+import { inflateSync, deflateSync, type Zlib } from 'node:zlib';
 
 // ---------------------------------------------------------------------------
 // The scenario's users, derived from the contest's one fixed seed.
@@ -164,8 +164,10 @@ export function sha1Hex(data: Buffer): string {
 }
 
 export function hashObject(type: ObjectType, data: Buffer): string {
+  // Incremental hash: the same digest as hashing header+data, without
+  // copying the (possibly large) data into a throwaway buffer first.
   const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, data]));
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 export interface CommitParts {
@@ -353,19 +355,22 @@ export interface PackReadResult {
 }
 
 /**
- * Inflate exactly one zlib stream starting at `offset`. The streaming Inflater
- * reports `bytesWritten` — the input bytes the handle consumed — which is the
- * stream's exact length, so the next entry starts right after it.
+ * Inflate exactly one zlib stream starting at `offset`, synchronously.
+ * inflateSync with `info: true` reports the engine's bytesWritten — the input
+ * bytes the stream consumed — which is the stream's exact length, so the next
+ * entry starts right after it. (The previous version created a streaming
+ * Inflater per object; each one cost an event-loop turn per object, which is
+ * what a receive-pack pays per pushed object.)
  */
-function inflateOne(buf: Buffer, offset: number): Promise<{ data: Buffer; consumed: number }> {
-  return new Promise((resolve, reject) => {
-    const inflater = createInflate();
-    const chunks: Buffer[] = [];
-    inflater.on('data', (chunk: Buffer) => chunks.push(chunk));
-    inflater.on('error', reject);
-    inflater.on('end', () => resolve({ data: Buffer.concat(chunks), consumed: inflater.bytesWritten }));
-    inflater.end(buf.subarray(offset));
-  });
+function inflateOne(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
+  // @types/node does not declare the info overload's { buffer, engine }
+  // return shape, so cast: at runtime inflateSync with info:true returns
+  // exactly that (verified: engine.bytesWritten is the stream's length).
+  const { buffer, engine } = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: Zlib;
+  };
+  return { data: buffer, consumed: engine.bytesWritten };
 }
 
 /** Read a pack of plain objects. Throws on a bad checksum, a delta entry, or truncation. */
@@ -395,7 +400,7 @@ export async function readPack(pack: Buffer): Promise<PackReadResult> {
     if (typeNum === 6 || typeNum === 7) throw new Error('delta pack entries are not supported');
     const type = PACK_TYPE_NAMES[typeNum];
     if (type === undefined) throw new Error(`unknown pack object type ${typeNum}`);
-    const { data, consumed } = await inflateOne(pack, offset);
+    const { data, consumed } = inflateOne(pack, offset);
     offset += consumed;
     if (data.length !== size) throw new Error(`pack object size mismatch: header ${size}, inflated ${data.length}`);
     objects.set(hashObject(type, data), { type, data });
@@ -730,11 +735,12 @@ export class Store {
     if (depth !== null) {
       // Walk commits by distance from the wants; commits at distance depth-1
       // are the new shallow boundary (included, with their trees).
+      // An index pointer, not shift(): the queue is walked once, in order.
       const queue: Array<{ oid: string; distance: number }> = wants.map((oid) => ({ oid, distance: 0 }));
       const seenCommit = new Set<string>();
       const includedCommits: string[] = [];
-      while (queue.length > 0) {
-        const { oid, distance } = queue.shift() as { oid: string; distance: number };
+      for (let qi = 0; qi < queue.length; qi += 1) {
+        const { oid, distance } = queue[qi] as { oid: string; distance: number };
         if (seenCommit.has(oid)) continue;
         seenCommit.add(oid);
         const commit = this.commitOf(repo, oid);
