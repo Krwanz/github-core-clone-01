@@ -143,6 +143,10 @@ interface FetchRequest {
   haves: string[];
   shallow: string[];
   depth: number | null;
+  /** True when the client sent `done`: negotiation is over, send the pack.
+   * False means the client is in a multi-round have/ACK negotiation and
+   * expects an acknowledgments section first. */
+  done: boolean;
 }
 
 /** Parse a v2 upload-pack request body into a command or a fetch. */
@@ -155,7 +159,7 @@ function parseV2UploadPack(body: Buffer): { kind: 'ls-refs' | 'fetch'; prefixes:
   }
   let command: string | null = null;
   const prefixes: string[] = [];
-  const fetch: FetchRequest = { wants: [], haves: [], shallow: [], depth: null };
+  const fetch: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, done: false };
   let seenDelim = false;
   for (const packet of packets) {
     if (packet.kind === 'flush') break;
@@ -171,6 +175,7 @@ function parseV2UploadPack(body: Buffer): { kind: 'ls-refs' | 'fetch'; prefixes:
     if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length).replace(/\n$/, ''));
     else if (line.startsWith('want ')) fetch.wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) fetch.haves.push(line.slice(5).trim());
+    else if (line.trim() === 'done') fetch.done = true;
     else if (line.startsWith('shallow ')) fetch.shallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) {
       const depth = parseInt(line.slice(7).trim(), 10);
@@ -192,7 +197,7 @@ function parseV0UploadPack(body: Buffer): FetchRequest | null {
   } catch {
     return null;
   }
-  const fetch: FetchRequest = { wants: [], haves: [], shallow: [], depth: null };
+  const fetch: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, done: false };
   let seenFlush = false;
   for (const packet of packets) {
     if (packet.kind === 'flush') {
@@ -213,6 +218,7 @@ function parseV0UploadPack(body: Buffer): FetchRequest | null {
       }
     } else {
       if (line.startsWith('have ')) fetch.haves.push(line.slice(5).trim());
+      else if (line.trim() === 'done') fetch.done = true;
     }
   }
   return fetch;
@@ -234,15 +240,32 @@ function sidebandPack(pack: Buffer): Buffer {
 function v2FetchResponse(store: Store, repo: RepoRec, fetch: FetchRequest): Buffer {
   const { objects, shallow, unshallow } = store.fetchSet(repo, fetch.wants, fetch.haves, fetch.depth, fetch.shallow);
   const parts: Buffer[] = [];
-  // acknowledgments
-  const ackLines: string[] = ['acknowledgments\n'];
-  const allHavesKnown = fetch.haves.length > 0 && fetch.haves.every((have) => repo.objects.has(have));
-  if (fetch.haves.length === 0) ackLines.push('NAK\n');
-  else if (allHavesKnown) {
-    for (const have of fetch.haves) ackLines.push(`ACK ${have}\n`);
-    ackLines.push('ready\n');
-  } else ackLines.push('NAK\n');
-  parts.push(encodePktLines([...ackLines, 'flush']));
+  // Negotiation (git 2.43 fetch-pack.c: FETCH_PROCESS_ACKS vs FETCH_GET_PACK).
+  // When the client did NOT send `done` it is in a multi-round have/ACK
+  // negotiation (real git's fetch round 1) and expects the acknowledgments
+  // section first — without it git dies with "expected 'acknowledgments',
+  // received 'packfile'". When the client DID send `done` (clones, and the
+  // kit client, which always sends it), the response must start with the
+  // packfile section instead — sending `acknowledgments` there makes git die
+  // with the mirror error "expected 'packfile', received 'acknowledgments'".
+  // With no haves there is nothing to acknowledge, so `done` is implied.
+  const negotiating = !fetch.done && fetch.haves.length > 0;
+  if (negotiating) {
+    const allHavesKnown = fetch.haves.every((have) => repo.objects.has(have));
+    if (allHavesKnown) {
+      // ACKs + ready: the section ends with a DELIM (not a flush) because the
+      // packfile follows in this same response (fetch-pack.c process_ack).
+      const ackLines: Array<string | 'delim'> = ['acknowledgments\n'];
+      for (const have of fetch.haves) ackLines.push(`ACK ${have}\n`);
+      ackLines.push('ready\n', 'delim');
+      parts.push(encodePktLines(ackLines));
+    } else {
+      // NAK: the section ends with a FLUSH and nothing else follows — the
+      // client sends another round (with more haves, or `done`).
+      parts.push(encodePktLines(['acknowledgments\n', 'NAK\n', 'flush']));
+      return Buffer.concat(parts);
+    }
+  }
   // shallow-info
   if (shallow.length > 0 || unshallow.length > 0) {
     const lines: Array<string | 'flush'> = ['shallow-info\n'];
@@ -251,15 +274,12 @@ function v2FetchResponse(store: Store, repo: RepoRec, fetch: FetchRequest): Buff
     lines.push('flush');
     parts.push(encodePktLines(lines));
   }
-  // wanted-refs (always present, even when no want matches a ref tip)
-  const wantedRefs: string[] = [];
-  const advertised = refLines(repo);
-  for (const want of fetch.wants) {
-    for (const line of advertised) {
-      if (line.oid === want && line.name.startsWith('refs/')) wantedRefs.push(`${want} ${line.name}\n`);
-    }
-  }
-  parts.push(encodePktLines(['wanted-refs\n', ...wantedRefs, 'flush']));
+  // No wanted-refs section: git's receive_wanted_refs requires the section to
+  // end with a DELIM (ours ended with a flush, hence "error processing wanted
+  // refs: 2"), and each line's ref must be in the client's sought list; git
+  // http-backend omits the section entirely, and no client consumes it (the
+  // kit parses it but never reads it). Omitting is the safe, reference-matching
+  // choice.
   // packfile
   if (objects.size > 0) {
     const pack = writePack([...objects.values()]);
@@ -383,9 +403,15 @@ export async function handleReceivePack(store: Store, owner: string, repoName: s
   return { ...result, body: reportBytes(reportLines.join('')) };
 }
 
-/** The report-status stream, pkt-lined inside sideband band 1. */
+/** The report-status stream, pkt-lined inside sideband band 1. The inner
+ * pkt-line stream MUST end with its own flush: git's report reader parses
+ * pkt-lines out of the demultiplexed band-1 data and expects a flush to
+ * terminate the report — without it, git reads "unpack ok" and then dies with
+ * "the remote end hung up unexpectedly". The outer flush after the sideband
+ * packet terminates the sideband stream itself. Reference (git http-backend)
+ * sends both: band-1[lines..., 0000], then 0000. */
 function reportBytes(text: string): Buffer {
-  const inner = encodePktLines(text.split('\n').filter((line) => line !== '').map((line) => `${line}\n`));
+  const inner = encodePktLines([...text.split('\n').filter((line) => line !== '').map((line) => `${line}\n`), 'flush']);
   const parts: Buffer[] = [];
   // Same 65520-byte pkt-line limit as sidebandPack (4 length + 1 band + data).
   const CHUNK = 65515;
